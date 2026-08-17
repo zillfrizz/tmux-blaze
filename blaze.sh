@@ -275,6 +275,100 @@ _cleanup() {
 }
 
 # ---------------------------------------------------------------------------
+# Résurrection : miroir de cleanup. Un projet dont la session a disparu (ex:
+# serveur tmux redémarré, donc TOUTES les sessions sont mortes en même temps)
+# est recréé plutôt que jeté. Les ids tmux (session_id/window_id) qui servent
+# de noms de dossiers sont réassignés à zéro par le nouveau serveur, donc on
+# met d'abord tous les projets morts de côté sous un nom temporaire avant de
+# recréer quoi que ce soit : sinon un nouveau "$0" fraîchement créé pourrait
+# tomber sur un dossier "$0" d'un projet mort pas encore traité et le polluer.
+# ---------------------------------------------------------------------------
+_resurrect() {
+    local projectDir sid tmpName
+    local -a toResurrect=()
+    for projectDir in "$rootState"/projects/*/; do
+        [ -d "$projectDir" ] || continue
+        sid="$(basename "$projectDir")"
+        if ! tmux has-session -t "$sid" 2>/dev/null; then
+            tmpName=".resurrect.$$.${#toResurrect[@]}"
+            mv "$projectDir" "$rootState/projects/$tmpName"
+            toResurrect+=("$tmpName")
+        fi
+    done
+
+    for tmpName in "${toResurrect[@]}"; do
+        "$modBlaze" _resurrectProject "$rootState/projects/$tmpName"
+    done
+}
+
+_resurrectProject() {
+    local tmpDir="$1"
+    local -a surfaceNames
+    mapfile -t surfaceNames < <(ls "$tmpDir"/surfaces 2>/dev/null)
+    if [ "${#surfaceNames[@]}" -eq 0 ]; then
+        rm -rf "$tmpDir"
+        return
+    fi
+
+    # Même problème qu'entre projets, mais au niveau des fenêtres : le compteur
+    # global tmux (window_id) peut retomber sur un id encore utilisé par un
+    # autre concern de CE projet pas encore renommé. On met donc d'abord tous
+    # les concerns de côté sous un nom dérivé de leur ancien id (déterministe,
+    # pas besoin de table de correspondance) avant de créer la moindre fenêtre.
+    local surfaceName surfaceDir concernDir wid
+    for surfaceName in "${surfaceNames[@]}"; do
+        surfaceDir="$tmpDir/surfaces/$surfaceName"
+        for concernDir in "$surfaceDir"/concerns/*/; do
+            [ -d "$concernDir" ] || continue
+            wid="$(basename "$concernDir")"
+            mv "$concernDir" "$surfaceDir/concerns/resurrect$wid"
+        done
+    done
+
+    # La surface/concern "current" persistés deviennent la 1ère fenêtre de la
+    # nouvelle session (tmux new-session en crée toujours une) : on retombe
+    # ainsi sur l'endroit exact où le projet en était avant de mourir.
+    local nameSurfaceCurrent firstSurfaceDir widFirst tmpWidFirst nameFirst
+    nameSurfaceCurrent="$(grep '^nameSurfaceCurrent=' "$tmpDir/this.state" 2>/dev/null | cut -d'=' -f2-)"
+    [ -d "$tmpDir/surfaces/$nameSurfaceCurrent" ] || nameSurfaceCurrent="${surfaceNames[0]}"
+    firstSurfaceDir="$tmpDir/surfaces/$nameSurfaceCurrent"
+    widFirst="$(grep '^widConcernCurrent=' "$firstSurfaceDir/this.state" 2>/dev/null | cut -d'=' -f2-)"
+    tmpWidFirst="resurrect$widFirst"
+    [ -d "$firstSurfaceDir/concerns/$tmpWidFirst" ] \
+        || tmpWidFirst="$(basename "$(ls -d "$firstSurfaceDir"/concerns/*/ | head -n1)")"
+    nameFirst="$("$modConcern" getName "$firstSurfaceDir/concerns/$tmpWidFirst")"
+
+    local sidNew widNewFirst
+    sidNew="$(tmux new-session -d -n "$nameFirst" -P -F '#{session_id}')"
+    widNewFirst="$(tmux list-windows -t "$sidNew" -F '#{window_id}' | head -n1)"
+    mv "$firstSurfaceDir/concerns/$tmpWidFirst" "$firstSurfaceDir/concerns/$widNewFirst"
+    sed -i "s#^widConcernCurrent=.*#widConcernCurrent=$widNewFirst#" "$firstSurfaceDir/this.state"
+
+    # -d partout : sinon chaque nouvelle fenêtre prend le focus et on termine
+    # sur la dernière créée au lieu de la fenêtre "current" persistée.
+    local nameConcern widNew widCurrent anyWid
+    for surfaceName in "${surfaceNames[@]}"; do
+        surfaceDir="$tmpDir/surfaces/$surfaceName"
+        for concernDir in "$surfaceDir"/concerns/*/; do
+            [ -d "$concernDir" ] || continue
+            wid="$(basename "$concernDir")"
+            [[ "$wid" == resurrect* ]] || continue
+            nameConcern="$("$modConcern" getName "$concernDir")"
+            widNew="$(tmux new-window -d -t "$sidNew" -n "$nameConcern" -P -F '#{window_id}')"
+            mv "$concernDir" "$surfaceDir/concerns/$widNew"
+        done
+
+        widCurrent="$(grep '^widConcernCurrent=' "$surfaceDir/this.state" 2>/dev/null | cut -d'=' -f2-)"
+        if [ ! -d "$surfaceDir/concerns/$widCurrent" ]; then
+            anyWid="$(ls "$surfaceDir"/concerns | head -n1)"
+            [ -n "$anyWid" ] && sed -i "s#^widConcernCurrent=.*#widConcernCurrent=$anyWid#" "$surfaceDir/this.state"
+        fi
+    done
+
+    mv "$tmpDir" "$rootState/projects/$sidNew"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 case "$1" in
@@ -282,7 +376,8 @@ _wizardStart|_wizardStep|_wizardAnswer|_wizardFinish|\
 _createProject|_createSurface|_createConcern|\
 _renameProject|_renameSurface|_renameConcern|\
 _killConcern|_killSurface|_killProject|_afterSurfaceRemoved|\
-_changeConcern|_changeSurface|_changeProject|_cleanup)
+_changeConcern|_changeSurface|_changeProject|_cleanup|\
+_resurrect|_resurrectProject)
     "$@"
     ;;
 createProject) "$modBlaze" _wizardStart Project ;;
